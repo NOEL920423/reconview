@@ -28,4 +28,5 @@ exec "$HOME/isaacsim/_build/linux-x86_64/release/isaac-sim.streaming.sh" \
     --livestream 2 \
     --/app/exts/devPaths/0="$HOME/PegasusSimulator/extensions/pegasus.simulator" \
     --enable pegasus.simulator \
+    --enable isaacsim.ros2.bridge \
     --exec "/home/noel_614420090/reconview/scripts/initialize_pegasus_world.py --scene \"$scene_path\""
