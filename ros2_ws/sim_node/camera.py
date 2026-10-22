@@ -2,6 +2,7 @@ from array import array
 import sys
 
 import numpy as np
+from PIL import Image as PILImage
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
@@ -149,9 +150,26 @@ class CameraReader: # CameraReader 負責讀取、檢查與辨識新 frame
 
 
 class CameraPublisher:
-    """Publish RGB and optional depth snapshots through an existing ROS node."""
+    """Publish optionally downsampled RGB/depth through an existing ROS node."""
 
-    def __init__(self, node, *, rgb_topic: str, frame_id: str, depth_topic=None):
+    def __init__(
+        self,
+        node,
+        *,
+        rgb_topic: str,
+        frame_id: str,
+        depth_topic=None,
+        output_size: tuple[int, int] | None = None,
+    ):
+        if output_size is not None:
+            if len(output_size) != 2 or any(
+                type(size) is not int or size <= 0 for size in output_size
+            ):
+                raise ValueError(
+                    "Output size must contain positive integer width and height"
+                )
+            output_size = tuple(output_size) # 在打包訊息前縮圖
+        self.output_size = output_size
         self.frame_id = frame_id
         self.rgb_publisher = node.create_publisher(
             Image, rgb_topic, qos_profile_sensor_data
@@ -162,9 +180,31 @@ class CameraPublisher:
             else node.create_publisher(Image, depth_topic, qos_profile_sensor_data)
         )
 
+    def _resize_pixels(self, pixels, resample: PILImage.Resampling):
+        """Downsample without changing aspect ratio or modifying source arrays."""
+        height, width = pixels.shape[:2]
+        if self.output_size is None or self.output_size == (width, height):
+            return pixels
+
+        output_width, output_height = self.output_size
+        if (
+            output_width > width
+            or output_height > height
+            or output_width * height != output_height * width
+        ):
+            raise ValueError(
+                f"Output size {self.output_size} must preserve the aspect ratio "
+                f"and not exceed the source size {(width, height)}"
+            )
+
+        resized = PILImage.fromarray(pixels).resize(
+            self.output_size, resample=resample
+        )
+        return np.asarray(resized)
+
     # 填入尺寸、encoding、frame_id、像素資料，並用 divmod() 將擷取時間拆成 sec 與 nanosec。step 是每列資料的 byte 數；data 是打包後的像素。
     def _make_image(self, pixels, encoding: str, stamp_ns: int) -> Image:
-        """Serialize a validated reader array with its source acquisition stamp."""
+        """Serialize output pixels with their source acquisition stamp."""
         height, width = pixels.shape[:2]
         channels = pixels.shape[2] if pixels.ndim == 3 else 1
         msg = Image()
@@ -184,14 +224,17 @@ class CameraPublisher:
     # rgb8 是每個色彩通道 8 bits；32FC1 是每個像素一個 32-bit 浮點數。
     def publish(self, frame) -> None:
         """Publish one new snapshot, preserving a shared RGB/depth timestamp."""
-        rgb_msg = self._make_image(frame["rgb"], "rgb8", frame["stamp_ns"])
+        rgb = self._resize_pixels(frame["rgb"], PILImage.Resampling.BOX)
+        rgb_msg = self._make_image(rgb, "rgb8", frame["stamp_ns"])
         depth_msg = None
         if self.depth_publisher is not None:
             if frame["depth"] is None:
                 raise ValueError("Depth publisher requires a snapshot with depth")
-            depth_msg = self._make_image(
-                frame["depth"], "32FC1", frame["stamp_ns"]
+            # Nearest-neighbor sampling keeps source depth values in meters.
+            depth = self._resize_pixels(
+                frame["depth"], PILImage.Resampling.NEAREST
             )
+            depth_msg = self._make_image(depth, "32FC1", frame["stamp_ns"])
 
         self.rgb_publisher.publish(rgb_msg)
         if depth_msg is not None:

@@ -115,6 +115,7 @@ async def initialize_pegasus(scene_path):
         ),
         "top_camera": CameraReader(vehicle_config.graphical_sensors[1]),
     }
+    camera_output_size = (640, 400)  # 提供給前視與俯視 Publisher
     # 建立前視、俯視兩個 Publisher 輔助物件，共用既有 sim_node
     camera_publishers = {
         "fpv_camera": CameraPublisher(
@@ -122,11 +123,13 @@ async def initialize_pegasus(scene_path):
             rgb_topic="/fpv_camera/rgb",
             depth_topic="/fpv_camera/depth",
             frame_id="fpv_camera_optical_frame",
+            output_size=camera_output_size,
         ),
         "top_camera": CameraPublisher(
             sim_node,
             rgb_topic="/top_camera/rgb",
             frame_id="top_camera_optical_frame",
+            output_size=camera_output_size,
         ),
     }
 
@@ -136,7 +139,7 @@ async def initialize_pegasus(scene_path):
     → 距上次發布至少經過 200 ms 模擬時間
     → 發布前視 RGB、前視 depth、俯視 RGB
     """
-    camera_publish_period_ns = 200_000_000
+    camera_publish_period_ns = 200_000_000 # 200 ms 模擬時間
     last_camera_publish_stamp_ns = None # 最近發布那組影像的擷取時間
     camera_published_groups = 0 # 完成三路發布呼叫的組數
     next_camera_log_time = 0.0
@@ -223,7 +226,9 @@ async def initialize_pegasus(scene_path):
     sim_node.get_logger().info(
         "Camera snapshot inspection and Image publishing enabled: "
         "/fpv_camera/rgb, /fpv_camera/depth, /top_camera/rgb "
-        "(max 5 Hz in simulation time, sensor data QoS, source capture timestamps)"
+        f"(output {camera_output_size[0]}x{camera_output_size[1]}, "
+        "RGB BOX, depth NEAREST, max 5 Hz in simulation time, "
+        "sensor data QoS, source capture timestamps)"
     )
 
     QuickLayout.quick_load(None, None) # 還原整份已 Quick Save 的視窗配置

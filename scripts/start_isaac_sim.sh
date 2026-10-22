@@ -24,7 +24,22 @@ echo "Scene selected: $scene_path"
 
 cd /home/noel_614420090/reconview
 
-exec "$HOME/isaacsim/_build/linux-x86_64/release/isaac-sim.streaming.sh" \
+# 這些是 Fast DDS 的傳輸緩衝設定；32 MiB = 32 × 1024 × 1024 bytes = 33,554,432 bytes
+export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-DEFAULT?sockets_size=33554432}"
+echo "Fast DDS transports: $FASTDDS_BUILTIN_TRANSPORTS"
+
+# Load Isaac Sim's bundled ROS libraries instead of the caller's system ROS.
+# Keep ROS_DOMAIN_ID and Fast DDS settings for communication and transport tests.
+exec env \
+    -u PYTHONPATH \
+    -u LD_LIBRARY_PATH \
+    -u AMENT_PREFIX_PATH \
+    -u CMAKE_PREFIX_PATH \
+    -u COLCON_PREFIX_PATH \
+    -u ROS_DISTRO \
+    -u ROS_VERSION \
+    -u ROS_PYTHON_VERSION \
+    "$HOME/isaacsim/_build/linux-x86_64/release/isaac-sim.streaming.sh" \
     --livestream 2 \
     --/app/exts/devPaths/0="$HOME/PegasusSimulator/extensions/pegasus.simulator" \
     --enable pegasus.simulator \
