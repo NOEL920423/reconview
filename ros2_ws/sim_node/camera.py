@@ -1,5 +1,6 @@
 from array import array
 import sys
+import time
 
 import numpy as np
 from PIL import Image as PILImage
@@ -171,6 +172,7 @@ class CameraPublisher:
             output_size = tuple(output_size) # 在打包訊息前縮圖
         self.output_size = output_size
         self.frame_id = frame_id
+        self.last_profile = {}
         self.rgb_publisher = node.create_publisher(
             Image, rgb_topic, qos_profile_sensor_data
         )
@@ -224,18 +226,38 @@ class CameraPublisher:
     # rgb8 是每個色彩通道 8 bits；32FC1 是每個像素一個 32-bit 浮點數。
     def publish(self, frame) -> None:
         """Publish one new snapshot, preserving a shared RGB/depth timestamp."""
+        if self.depth_publisher is not None and frame["depth"] is None:
+            raise ValueError("Depth publisher requires a snapshot with depth")
+
+        # Measure only this calling thread; source acquisition stamps stay intact.
+        profile = {}
+        wall_start_ns = time.perf_counter_ns()
+        cpu_start_ns = time.thread_time_ns()
         rgb = self._resize_pixels(frame["rgb"], PILImage.Resampling.BOX)
-        rgb_msg = self._make_image(rgb, "rgb8", frame["stamp_ns"])
-        depth_msg = None
+        depth = None
         if self.depth_publisher is not None:
-            if frame["depth"] is None:
-                raise ValueError("Depth publisher requires a snapshot with depth")
             # Nearest-neighbor sampling keeps source depth values in meters.
             depth = self._resize_pixels(
                 frame["depth"], PILImage.Resampling.NEAREST
             )
-            depth_msg = self._make_image(depth, "32FC1", frame["stamp_ns"])
+        profile["resize_cpu_ns"] = time.thread_time_ns() - cpu_start_ns
+        profile["resize_wall_ns"] = time.perf_counter_ns() - wall_start_ns
 
+        wall_start_ns = time.perf_counter_ns()
+        cpu_start_ns = time.thread_time_ns()
+        rgb_msg = self._make_image(rgb, "rgb8", frame["stamp_ns"])
+        depth_msg = None
+        if depth is not None:
+            depth_msg = self._make_image(depth, "32FC1", frame["stamp_ns"])
+        profile["pack_cpu_ns"] = time.thread_time_ns() - cpu_start_ns
+        profile["pack_wall_ns"] = time.perf_counter_ns() - wall_start_ns
+
+        wall_start_ns = time.perf_counter_ns()
+        cpu_start_ns = time.thread_time_ns()
         self.rgb_publisher.publish(rgb_msg)
         if depth_msg is not None:
             self.depth_publisher.publish(depth_msg)
+        # Returning from publish() does not acknowledge subscriber delivery.
+        profile["publish_call_cpu_ns"] = time.thread_time_ns() - cpu_start_ns
+        profile["publish_call_wall_ns"] = time.perf_counter_ns() - wall_start_ns
+        self.last_profile = profile

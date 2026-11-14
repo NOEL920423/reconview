@@ -26,6 +26,7 @@ class DatasetNode(Node):
 
     def __init__(self):
         super().__init__("dataset_node")
+        self.declare_parameter("stats_detail", False)
         self._max_pending = self.declare_parameter("max_pending_groups", 10).value
         wait_seconds = self.declare_parameter("max_wait_sim_sec", 1.0).value
         if self._max_pending <= 0:
@@ -220,34 +221,39 @@ class DatasetNode(Node):
         lines = [
             "=" * 48,
             f"sim_time_s              : {sim_time_s}",
-            f"latest_capture_time_s   : {capture_time_s}",
-            f"latest_stamp_ns         : {latest_stamp}",
             "",
             f"complete_groups         : {self._complete}",
             f"incomplete_groups       : {self._incomplete}",
             f"pending_groups          : {len(self._pending)}",
             f"last_sim_age_ms         : {age_ms}",
             f"max_sim_age_ms          : {max_age_ms}",
-        ]
-        for label, counts in (
-            ("received", self._received),
-            ("missing", self._missing),
-            ("dds_lost", self._dds_lost),
-        ):
-            lines.append("")
-            for stream, count in counts.items():
-                lines.append(f"{label + '_' + stream:<24}: {count}")
-        lines.extend([
-            "",
-            f"discard_timeout         : {self._discard_reasons['timeout']}",
-            f"discard_capacity        : {self._discard_reasons['capacity']}",
-            f"duplicates              : {self._duplicates}",
-            f"closed_ignored          : {self._closed_ignored}",
+            f"dds_lost_total          : {sum(self._dds_lost.values())}",
             f"invalid                 : {self._invalid}",
             f"clock_reset             : {self._clock_reset}",
-            f"blocked_after_reset     : {self._blocked_after_reset}",
-            "=" * 48,
-        ])
+        ]
+        if self.get_parameter("stats_detail").value:
+            lines.extend([
+                "",
+                f"latest_capture_time_s   : {capture_time_s}",
+                f"latest_stamp_ns         : {latest_stamp}",
+            ])
+            for label, counts in (
+                ("received", self._received),
+                ("missing", self._missing),
+                ("dds_lost", self._dds_lost),
+            ):
+                lines.append("")
+                for stream, count in counts.items():
+                    lines.append(f"{label + '_' + stream:<24}: {count}")
+            lines.extend([
+                "",
+                f"discard_timeout         : {self._discard_reasons['timeout']}",
+                f"discard_capacity        : {self._discard_reasons['capacity']}",
+                f"duplicates              : {self._duplicates}",
+                f"closed_ignored          : {self._closed_ignored}",
+                f"blocked_after_reset     : {self._blocked_after_reset}",
+            ])
+        lines.append("=" * 48)
         # One log call keeps the ROS prefix outside the field-by-field block.
         self.get_logger().info("\n" + "\n".join(lines))
 

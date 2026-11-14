@@ -2,8 +2,10 @@ import asyncio
 import argparse
 import sys
 import time
+import threading
 from pathlib import Path
 
+import numpy as np
 import rclpy
 import omni.timeline
 from rclpy.signals import SignalHandlerOptions
@@ -96,6 +98,7 @@ async def initialize_pegasus(scene_path):
         rclpy.init(args=[], signal_handler_options=SignalHandlerOptions.NO)
 
     sim_node = rclpy.create_node("sim_node", use_global_arguments=False)
+    sim_node.declare_parameter("stats_detail", False)
     clock_publisher = ClockPublisher(sim_node)
 
     def publish_clock(_dt):
@@ -144,9 +147,35 @@ async def initialize_pegasus(scene_path):
     camera_published_groups = 0 # 完成三路發布呼叫的組數
     next_camera_log_time = 0.0
 
+    camera_profile_stages = ("read", "resize", "pack", "publish_call")
+    camera_cpu_profile = {}
+
+    def reset_camera_profile():
+        """Start the next timing window at the first active camera callback."""
+        camera_cpu_profile.update(
+            window_start_ns=None,
+            cpu_ns=0,
+            wall_ns=0,
+            wall_max_ns=0,
+            calls=0,
+            published_groups=0,
+        )
+        for stage_name in camera_profile_stages:
+            camera_cpu_profile[f"{stage_name}_cpu_ns"] = 0
+            camera_cpu_profile[f"{stage_name}_wall_ns"] = 0
+
+    reset_camera_profile()
+
     def reset_camera_readers(event):
         nonlocal next_camera_log_time, last_camera_publish_stamp_ns
         nonlocal camera_published_groups
+        if event.type in (
+            int(omni.timeline.TimelineEventType.PLAY),
+            int(omni.timeline.TimelineEventType.PAUSE),
+            int(omni.timeline.TimelineEventType.STOP),
+        ):
+            reset_camera_profile()
+            next_camera_log_time = 0.0
         if event.type == int(omni.timeline.TimelineEventType.STOP):
             for reader in camera_readers.values():
                 reader.reset()
@@ -165,10 +194,24 @@ async def initialize_pegasus(scene_path):
         if not pg.world.is_playing():
             return
 
+        camera_work_wall_start_ns = time.perf_counter_ns()
+        if camera_cpu_profile["window_start_ns"] is None:
+            camera_cpu_profile["window_start_ns"] = camera_work_wall_start_ns
+            next_camera_log_time = time.monotonic() + 1.0
+        camera_work_start_ns = time.thread_time_ns()
+
         try:
+            read_wall_start_ns = time.perf_counter_ns()
+            read_cpu_start_ns = time.thread_time_ns()
             for reader in camera_readers.values():
                 # Reader 等待影像或讀到重複 frame 時，不會重複發布
                 reader.read()
+            camera_cpu_profile["read_cpu_ns"] += (
+                time.thread_time_ns() - read_cpu_start_ns
+            )
+            camera_cpu_profile["read_wall_ns"] += (
+                time.perf_counter_ns() - read_wall_start_ns
+            )
 
             fpv_frame = camera_readers["fpv_camera"].last_frame
             top_frame = camera_readers["top_camera"].last_frame
@@ -190,37 +233,124 @@ async def initialize_pegasus(scene_path):
                     or stamp_ns - last_camera_publish_stamp_ns >= camera_publish_period_ns # 核心判斷
                 )
                 if interval_ready:
-                    camera_publishers["fpv_camera"].publish(fpv_frame)
-                    camera_publishers["top_camera"].publish(top_frame)
+                    for name, frame in (
+                        ("fpv_camera", fpv_frame),
+                        ("top_camera", top_frame),
+                    ):
+                        publisher = camera_publishers[name]
+                        publisher.publish(frame)
+                        for key, value in publisher.last_profile.items():
+                            camera_cpu_profile[key] += value
                     last_camera_publish_stamp_ns = stamp_ns
                     # Count completed publish calls, not subscriber deliveries.
                     camera_published_groups += 1
+                    camera_cpu_profile["published_groups"] += 1
         except Exception:
             pg.world.remove_render_callback("read_cameras")
             sim_node.get_logger().error(
                 "Camera reading and publishing stopped after an error; see traceback"
             )
             raise
-
+        # 每次執行都會累計，包含沒有達到發布間隔的 callback
+        camera_cpu_profile["cpu_ns"] += (
+            time.thread_time_ns() - camera_work_start_ns
+        )
+        camera_work_wall_end_ns = time.perf_counter_ns()
+        camera_work_wall_ns = camera_work_wall_end_ns - camera_work_wall_start_ns
+        camera_cpu_profile["wall_ns"] += camera_work_wall_ns
+        camera_cpu_profile["wall_max_ns"] = max(
+            camera_cpu_profile["wall_max_ns"], camera_work_wall_ns
+        )
+        camera_cpu_profile["calls"] += 1
         # Wall time only limits console output; capture stamps come from snapshots.
         now = time.monotonic()
         if now < next_camera_log_time:
             return
         next_camera_log_time = now + 1.0
-        for name, reader in camera_readers.items():
-            sim_node.get_logger().info(f"[camera] {name}: {reader.describe()}")
-        sim_node.get_logger().info(
-            f"[camera] published_groups={camera_published_groups}, "
-            f"latest_published_stamp_ns={last_camera_publish_stamp_ns}, "
-            f"min_publish_interval_ns={camera_publish_period_ns}"
-        )
+        profile_now_ns = camera_work_wall_end_ns
+        window_ns = profile_now_ns - camera_cpu_profile["window_start_ns"]
+        cpu_ms = camera_cpu_profile["cpu_ns"] / 1_000_000
+        cpu_percent = 100 * camera_cpu_profile["cpu_ns"] / window_ns
+        wall_ms = camera_cpu_profile["wall_ns"] / 1_000_000
+        wall_max_ms = camera_cpu_profile["wall_max_ns"] / 1_000_000
+        show_details = sim_node.get_parameter("stats_detail").value
+
+        rows = [
+            ("camera_callback_thread_id", threading.get_native_id()),
+            ("profile_window_wall_s", f"{window_ns / 1e9:.3f}"),
+            ("camera_calls", camera_cpu_profile["calls"]),
+            ("published_groups_window", camera_cpu_profile["published_groups"]),
+            ("published_groups_total", camera_published_groups),
+            None,
+            ("camera_work_cpu_percent", f"{cpu_percent:.3f}"),
+            ("camera_work_wall_max_ms", f"{wall_max_ms:.3f}"),
+        ]
+        if show_details:
+            rows.extend([
+                ("latest_published_stamp_ns", last_camera_publish_stamp_ns),
+                ("camera_work_cpu_ms", f"{cpu_ms:.3f}"),
+                ("camera_work_wall_ms", f"{wall_ms:.3f}"),
+            ])
+        rows.append(None)
+        for stage_name in camera_profile_stages:
+            stage_cpu_ms = camera_cpu_profile[f"{stage_name}_cpu_ns"] / 1_000_000
+            rows.append((f"{stage_name}_cpu_ms", f"{stage_cpu_ms:.3f}"))
+            if show_details:
+                stage_wall_ms = camera_cpu_profile[f"{stage_name}_wall_ns"] / 1_000_000
+                rows.append((f"{stage_name}_wall_ms", f"{stage_wall_ms:.3f}"))
+        rows.append(None)
+
+        # Keep the source diagnostics in the same report, outside the work timer.
+        if show_details:
+            for name, reader in camera_readers.items():
+                prefix = "fpv" if name == "fpv_camera" else "top"
+                rows.extend([
+                    (f"{prefix}_status", reader.status),
+                    (f"{prefix}_new_frames", reader.new_frames),
+                    (f"{prefix}_repeated_reads", reader.repeated_reads),
+                ])
+                if reader.status == "waiting_for_render":
+                    rows.append((f"{prefix}_wait_detail", reader.wait_detail))
+                frame = reader.last_frame
+                if frame is not None:
+                    rows.extend([
+                        (f"{prefix}_capture_time_s", f"{frame['rendering_time']:.6f}"),
+                        (f"{prefix}_stamp_ns", frame["stamp_ns"]),
+                        (f"{prefix}_dt_ns", frame["dt_ns"]),
+                        (f"{prefix}_render_reference", frame["render_reference"]),
+                        (f"{prefix}_rgb_shape", frame["rgb"].shape),
+                        (f"{prefix}_rgb_dtype", frame["rgb"].dtype),
+                    ])
+                    depth = frame["depth"]
+                    if depth is not None:
+                        valid = np.isfinite(depth) & (depth > 0)
+                        valid_ratio = np.count_nonzero(valid) / depth.size
+                        rows.extend([
+                            (f"{prefix}_depth_shape", depth.shape),
+                            (f"{prefix}_depth_dtype", depth.dtype),
+                            (f"{prefix}_depth_valid_ratio", f"{valid_ratio:.3f}"),
+                        ])
+                rows.append(None)
+            rows.append(("min_publish_interval_ns", camera_publish_period_ns))
         if readers_ready and fpv_frame is not None and top_frame is not None:
             delta_ns = top_frame["stamp_ns"] - fpv_frame["stamp_ns"]
             same_reference = top_frame["render_reference"] == fpv_frame["render_reference"]
-            sim_node.get_logger().info(
-                f"[camera] latest_stamp_delta_ns(top-fpv)={delta_ns}, "
-                f"same_render_reference={same_reference}"
-            )
+            rows.extend([
+                ("latest_stamp_delta_ns", delta_ns),
+                ("same_render_reference", same_reference),
+            ])
+        lines = ["=" * 56]
+        for row in rows:
+            if row is None:
+                lines.append("")
+            else:
+                field_name, value = row
+                lines.append(f"{field_name:<30} : {value}")
+        lines.append("=" * 56)
+        sim_node.get_logger().info("\n" + "\n".join(lines))
+
+        reset_camera_profile()
+        camera_cpu_profile["window_start_ns"] = profile_now_ns
 
     pg.world.add_render_callback("read_cameras", read_cameras)
     sim_node.get_logger().info(
@@ -228,7 +358,8 @@ async def initialize_pegasus(scene_path):
         "/fpv_camera/rgb, /fpv_camera/depth, /top_camera/rgb "
         f"(output {camera_output_size[0]}x{camera_output_size[1]}, "
         "RGB BOX, depth NEAREST, max 5 Hz in simulation time, "
-        "sensor data QoS, source capture timestamps)"
+        "sensor data QoS, source capture timestamps). "
+        "Timing summaries every second; set stats_detail=true for full diagnostics."
     )
 
     QuickLayout.quick_load(None, None) # 還原整份已 Quick Save 的視窗配置
